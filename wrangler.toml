@@ -1,0 +1,11 @@
+name = "sch"
+main = "worker.js"
+compatibility_date = "2023-01-01"
+
+[[durable_objects.bindings]]
+name = "TUNNEL_PROXY"
+class_name = "TunnelProxy"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TunnelProxy"]
