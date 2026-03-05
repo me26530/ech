@@ -2,15 +2,13 @@ import { TunnelProxy } from "./do.js";
 
 export { TunnelProxy };
 
+// 鉴权 token：保持你原来的逻辑
 const TOKEN = "1105074071";
 
-// 固定分片数（Shard Count）
+// ✅ 固定分片数（Shard Count）= 4
 const SHARD_COUNT = 4;
 
-// 限流参数
-const MAX_CONCURRENT = 30; // 最大并发连接
-const MAX_PER_MINUTE = 30; // 每分钟新建连接数
-
+/** FNV-1a 32-bit hash：轻量、稳定 */
 function fnv1a32(str) {
   let h = 0x811c9dc5;
   for (let i = 0; i < str.length; i++) {
@@ -21,60 +19,36 @@ function fnv1a32(str) {
 }
 
 /**
- * 选择分片（Shard）——不使用 IP
+ * 选择分片（Shard）——不使用 IP（IP），不改客户端也能用
  * 优先级：
  * 1) ?shard=0..N-1 直接指定
  * 2) ?sk=xxx 自定义分片键
- * 3) Header: X-Shard-Key
- * 4) Sec-WebSocket-Key（WebSocket 握手自带，默认兜底）
+ * 3) X-Shard-Key header
+ * 4) Sec-WebSocket-Key（WebSocket（WS）握手必带）
  */
 function pickShard(request) {
   const url = new URL(request.url);
 
+  // 1) 强制分片号（调试/固定路由）
   const shardParam = url.searchParams.get("shard");
   if (shardParam != null) {
     const n = Number(shardParam);
-    if (Number.isFinite(n)) return ((n % SHARD_COUNT) + SHARD_COUNT) % SHARD_COUNT;
+    if (Number.isFinite(n)) {
+      return ((n % SHARD_COUNT) + SHARD_COUNT) % SHARD_COUNT;
+    }
   }
 
+  // 2) 自定义分片键（sk）
   const sk = url.searchParams.get("sk");
   if (sk) return fnv1a32(sk) % SHARD_COUNT;
 
+  // 3) Header 自定义分片键
   const headerKey = request.headers.get("X-Shard-Key");
   if (headerKey) return fnv1a32(headerKey) % SHARD_COUNT;
 
+  // 4) 兜底：WebSocket（WS）握手必带的 Sec-WebSocket-Key
   const wsKey = request.headers.get("Sec-WebSocket-Key") || "fallback";
   return fnv1a32(wsKey) % SHARD_COUNT;
-}
-
-async function rateLimitAcquire(env, token, connId) {
-  const limiterId = env.TUNNEL_PROXY.idFromName("limiter");
-  const limiter = env.TUNNEL_PROXY.get(limiterId);
-
-  return limiter.fetch("https://limiter/rl/acquire", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      token,
-      connId,
-      maxConcurrent: MAX_CONCURRENT,
-      maxPerMinute: MAX_PER_MINUTE,
-    }),
-  });
-}
-
-async function rateLimitRelease(env, token, connId) {
-  const limiterId = env.TUNNEL_PROXY.idFromName("limiter");
-  const limiter = env.TUNNEL_PROXY.get(limiterId);
-
-  // best-effort
-  await limiter
-    .fetch("https://limiter/rl/release", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, connId }),
-    })
-    .catch(() => {});
 }
 
 export default {
@@ -82,7 +56,7 @@ export default {
     try {
       const upgradeHeader = request.headers.get("Upgrade");
 
-      // 非 WebSocket 请求：保持原行为
+      // 非 WebSocket（WS）请求：保持原行为
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
         return new URL(request.url).pathname === "/"
           ? new Response("Welcome to nginx!", {
@@ -92,38 +66,17 @@ export default {
           : new Response("Expected WebSocket", { status: 426 });
       }
 
-      // 鉴权：保持原行为（Sec-WebSocket-Protocol 必须等于 TOKEN）
-      const proto = request.headers.get("Sec-WebSocket-Protocol");
-      if (TOKEN && proto !== TOKEN) return new Response("Unauthorized", { status: 401 });
-
-      // 先申请限流令牌
-      const connId = crypto.randomUUID();
-      const rlResp = await rateLimitAcquire(env, proto || "default", connId);
-      if (!rlResp.ok) {
-        const msg = await rlResp.text().catch(() => "Rate limited");
-        return new Response(msg, { status: rlResp.status || 429 });
+      // 鉴权：保持原行为（要求 Sec-WebSocket-Protocol == token）
+      if (TOKEN && request.headers.get("Sec-WebSocket-Protocol") !== TOKEN) {
+        return new Response("Unauthorized", { status: 401 });
       }
 
-      // 固定分片路由
+      // ✅ 固定分片：idFromName("shard-x")，不再 newUniqueId()
       const shard = pickShard(request);
       const id = env.TUNNEL_PROXY.idFromName(`shard-${shard}`);
       const stub = env.TUNNEL_PROXY.get(id);
 
-      // 把 connId / token 传给 DO，便于 close 时释放
-      const newHeaders = new Headers(request.headers);
-      newHeaders.set("X-Conn-Id", connId);
-      newHeaders.set("X-Auth-Token", proto || "default");
-
-      const forwarded = new Request(request, { headers: newHeaders });
-
-      const resp = await stub.fetch(forwarded);
-
-      // 如果升级失败，释放令牌（避免占用并发计数）
-      if (resp.status !== 101) {
-        ctx.waitUntil(rateLimitRelease(env, proto || "default", connId));
-      }
-
-      return resp;
+      return stub.fetch(request);
     } catch (err) {
       return new Response(err?.toString?.() || "Internal Error", { status: 500 });
     }
