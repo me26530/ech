@@ -1,0 +1,13 @@
+{
+  "name": "ech-workers-cloudflare-deploy-echdb-echdl",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute $CF_D1_DATABASE_NAME --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
