@@ -4,21 +4,18 @@ var __name = (target, value) =>
 
 // src/index.js
 import { DurableObject } from "cloudflare:workers";
+import { connect } from "cloudflare:sockets";
 
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 
 /**
  * ECH-Workers 客户端身份令牌
- * 对应客户端里的：身份令牌
  */
 var CLIENT_TOKEN = "1105074071";
 
 /**
  * 管理接口令牌
- * /api/cleanup/list?admin=CHANGE_ME_ADMIN_TOKEN
- * POST /api/cleanup?admin=CHANGE_ME_ADMIN_TOKEN
- * 如果不想管理接口鉴权，可以改成：var ADMIN_TOKEN = "";
  */
 var ADMIN_TOKEN = "CHANGE_ME_ADMIN_TOKEN";
 
@@ -28,23 +25,22 @@ var CLEANUP_LIST_LIMIT = 100;
 /** 默认清理多久以前的记录：1 天 */
 var CLEANUP_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/** Cloudflare fallback IP，裸 IPv6，不带 [] */
+/** fallback 域名，按你的要求不改 */
 const CF_FALLBACK_IPS = ["fdip.houyitfg.top"];
 
 const encoder = new TextEncoder();
 
 /**
- * 使用你指定的参数
+ * ECH 实际使用的性能参数
+ * 已移除 VLESS/v2ray 用的 id 和 maxED
  */
 const CFG = {
-  id: "2523c510-9ff0-415b-9582-93949bfae7e3",
   chunk: 64 * 1024,
   dnPack: 32 * 1024,
   dnTail: 512,
   dnMs: 0,
   upPack: 16 * 1024,
   upQMax: 256 * 1024,
-  maxED: 8 * 1024,
   concur: 4,
 };
 
@@ -63,8 +59,7 @@ function toU8(data) {
 }
 
 /**
- * 上行队列：
- * WebSocket -> TCP
+ * 上行队列：WS -> TCP
  */
 function mkQ(cap, qCap = cap, itemsMax = Math.max(1, qCap >> 8)) {
   let q = [];
@@ -169,10 +164,10 @@ function mkQ(cap, qCap = cap, itemsMax = Math.max(1, qCap >> 8)) {
 }
 
 /**
- * 下行打包：
- * TCP -> WebSocket
+ * 下行打包：TCP -> WS
  *
- * 注意：这里没有背压，没有 bufferedAmount 等待。
+ * 注意：
+ * 这里没有 bufferedAmount 背压。
  */
 function mkDn(w) {
   const cap = CFG.dnPack;
@@ -295,10 +290,9 @@ function mkDn(w) {
 }
 
 /**
- * BYOB 下行读取：
- * TCP readable -> WebSocket
+ * BYOB 下行读取：TCP readable -> WebSocket
  *
- * 不加背压。
+ * 无背压。
  */
 async function mill(readable, webSocket, onDone) {
   let reader = null;
@@ -377,10 +371,10 @@ async function mill(readable, webSocket, onDone) {
 }
 
 /**
- * 使用 request.fetcher.connect()
+ * TCP 并发竞速连接
  */
-function sprout(fetcher, hostname, port) {
-  const s = fetcher.connect({ hostname, port });
+function sprout(hostname, port) {
+  const s = connect({ hostname, port });
 
   if (s.opened) {
     return s.opened.then(() => s);
@@ -389,19 +383,12 @@ function sprout(fetcher, hostname, port) {
   return Promise.resolve(s);
 }
 
-function raceSprout(fetcher, hostname, port) {
-  if (!fetcher?.connect) {
-    return Promise.reject(new Error("request.fetcher.connect unavailable"));
-  }
-
+function raceSprout(hostname, port) {
   if (CFG.concur <= 1) {
-    return sprout(fetcher, hostname, port);
+    return sprout(hostname, port);
   }
 
-  const tasks = Array.from(
-    { length: CFG.concur },
-    () => sprout(fetcher, hostname, port)
-  );
+  const tasks = Array.from({ length: CFG.concur }, () => sprout(hostname, port));
 
   return Promise.any(tasks).then((winner) => {
     for (const task of tasks) {
@@ -451,14 +438,6 @@ var TcpProxy = class extends DurableObject {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    const fetcher = request.fetcher;
-
-    if (!fetcher?.connect) {
-      return new Response("request.fetcher.connect unavailable", {
-        status: 500,
-      });
-    }
-
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
@@ -472,7 +451,7 @@ var TcpProxy = class extends DurableObject {
       server.binaryType = "arraybuffer";
     } catch {}
 
-    this.handleSession(server, fetcher).catch((err) => {
+    this.handleSession(server).catch((err) => {
       console.error("[DO] session error:", err?.message || err);
       safeCloseWebSocket(server);
     });
@@ -488,7 +467,7 @@ var TcpProxy = class extends DurableObject {
     return new Response(null, responseInit);
   }
 
-  async handleSession(webSocket, fetcher) {
+  async handleSession(webSocket) {
     let remoteSocket = null;
     let remoteWriter = null;
     let connected = false;
@@ -588,7 +567,7 @@ var TcpProxy = class extends DurableObject {
             hostname = `${hostname.replace(/:/g, "-")}.sslip.io`;
           }
 
-          remoteSocket = await raceSprout(fetcher, hostname, port);
+          remoteSocket = await raceSprout(hostname, port);
 
           remoteSocket.closed.catch((err) => {
             if (err?.message?.includes("currently being piped to")) return;
@@ -601,9 +580,6 @@ var TcpProxy = class extends DurableObject {
           remoteWriter = remoteSocket.writable.getWriter();
           connected = true;
 
-          /**
-           * 不阻塞建连
-           */
           this.ctx.waitUntil(this.updateTarget(`${host}:${port}`));
 
           if (firstFrameData) {
