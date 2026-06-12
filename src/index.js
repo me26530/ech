@@ -11,11 +11,15 @@ const WS_READY_STATE_CLOSING = 2;
 
 /**
  * ECH-Workers 客户端身份令牌
+ * 对应客户端里的：身份令牌
  */
 var CLIENT_TOKEN = "1105074071";
 
 /**
  * 管理接口令牌
+ * /api/cleanup/list?admin=CHANGE_ME_ADMIN_TOKEN
+ * POST /api/cleanup?admin=CHANGE_ME_ADMIN_TOKEN
+ * 如果不想管理接口鉴权，可以改成：var ADMIN_TOKEN = "";
  */
 var ADMIN_TOKEN = "CHANGE_ME_ADMIN_TOKEN";
 
@@ -25,388 +29,10 @@ var CLEANUP_LIST_LIMIT = 100;
 /** 默认清理多久以前的记录：1 天 */
 var CLEANUP_RETENTION_MS = 24 * 60 * 60 * 1000;
 
-/** fallback 域名，按你的要求不改 */
+/** Cloudflare fallback IP，保留 ECH 原版逻辑 */
 const CF_FALLBACK_IPS = ["fdip.houyitfg.top"];
 
 const encoder = new TextEncoder();
-
-/**
- * ECH 实际使用的性能参数
- * 已移除 VLESS/v2ray 用的 id 和 maxED
- */
-const CFG = {
-  chunk: 64 * 1024,
-  dnPack: 32 * 1024,
-  dnTail: 512,
-  dnMs: 0,
-  upPack: 16 * 1024,
-  upQMax: 256 * 1024,
-  concur: 4,
-};
-
-function toU8(data) {
-  if (data instanceof Uint8Array) return data;
-
-  if (data instanceof ArrayBuffer) {
-    return new Uint8Array(data);
-  }
-
-  if (ArrayBuffer.isView(data)) {
-    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  }
-
-  return encoder.encode(String(data));
-}
-
-/**
- * 上行队列：WS -> TCP
- */
-function mkQ(cap, qCap = cap, itemsMax = Math.max(1, qCap >> 8)) {
-  let q = [];
-  let h = 0;
-  let qB = 0;
-  let buf = null;
-
-  const trim = () => {
-    if (h > 32 && h * 2 >= q.length) {
-      q = q.slice(h);
-      h = 0;
-    }
-  };
-
-  const take = () => {
-    if (h >= q.length) return null;
-
-    const d = q[h];
-    q[h++] = undefined;
-    qB -= d.byteLength;
-
-    trim();
-    return d;
-  };
-
-  return {
-    get bytes() {
-      return qB;
-    },
-
-    get size() {
-      return q.length - h;
-    },
-
-    get empty() {
-      return h >= q.length;
-    },
-
-    clear() {
-      q = [];
-      h = 0;
-      qB = 0;
-      buf = null;
-    },
-
-    sow(d) {
-      const n = d?.byteLength || 0;
-
-      if (!n) return 1;
-
-      if (qB + n > qCap || q.length - h >= itemsMax) {
-        return 0;
-      }
-
-      q.push(d);
-      qB += n;
-      return 1;
-    },
-
-    bundle(d) {
-      d ||= take();
-
-      if (!d || h >= q.length || d.byteLength >= cap) {
-        return [d, 0];
-      }
-
-      let n = d.byteLength;
-      let e = h;
-
-      while (e < q.length) {
-        const x = q[e];
-        const nn = n + x.byteLength;
-
-        if (nn > cap) break;
-
-        n = nn;
-        e++;
-      }
-
-      if (e === h) {
-        return [d, 0];
-      }
-
-      const out = buf ||= new Uint8Array(cap);
-      out.set(d);
-
-      for (let o = d.byteLength; h < e;) {
-        const x = q[h];
-
-        q[h++] = undefined;
-        qB -= x.byteLength;
-
-        out.set(x, o);
-        o += x.byteLength;
-      }
-
-      trim();
-
-      return [out.subarray(0, n), 1];
-    },
-  };
-}
-
-/**
- * 下行打包：TCP -> WS
- *
- * 注意：
- * 这里没有 bufferedAmount 背压。
- */
-function mkDn(w) {
-  const cap = CFG.dnPack;
-  const tail = CFG.dnTail;
-  const low = Math.max(4096, tail << 3);
-
-  let pb = new Uint8Array(cap);
-  let p = 0;
-  let tp = 0;
-  let mq = 0;
-  let gen = 0;
-  let qk = 0;
-  let qr = 0;
-
-  const reap = () => {
-    if (tp) {
-      clearTimeout(tp);
-      tp = 0;
-    }
-
-    mq = 0;
-
-    if (!p) return;
-
-    if (w.readyState === WS_READY_STATE_OPEN) {
-      w.send(pb.subarray(0, p).slice());
-    }
-
-    pb = new Uint8Array(cap);
-    p = 0;
-    qr = 0;
-  };
-
-  const ripen = () => {
-    if (tp || mq) return;
-
-    mq = 1;
-    qk = gen;
-
-    queueMicrotask(() => {
-      mq = 0;
-
-      if (!p || tp) return;
-
-      if (cap - p < tail) {
-        reap();
-        return;
-      }
-
-      tp = setTimeout(() => {
-        tp = 0;
-
-        if (!p) return;
-
-        if (cap - p < tail) {
-          reap();
-          return;
-        }
-
-        if (qr < 2 && (gen !== qk || p < low)) {
-          qr++;
-          qk = gen;
-          ripen();
-          return;
-        }
-
-        reap();
-      }, Math.max(CFG.dnMs, 1));
-    });
-  };
-
-  return {
-    send(u) {
-      let o = 0;
-      const n = u?.byteLength || 0;
-
-      if (!n) return;
-
-      while (o < n) {
-        if (!p && n - o >= cap) {
-          const m = Math.min(cap, n - o);
-
-          if (w.readyState === WS_READY_STATE_OPEN) {
-            w.send(o || m !== n ? u.subarray(o, o + m) : u);
-          }
-
-          o += m;
-          continue;
-        }
-
-        const m = Math.min(cap - p, n - o);
-
-        pb.set(u.subarray(o, o + m), p);
-
-        p += m;
-        o += m;
-        gen++;
-
-        if (p === cap || cap - p < tail) {
-          reap();
-        } else {
-          ripen();
-        }
-      }
-    },
-
-    reap,
-
-    cancel() {
-      if (tp) {
-        clearTimeout(tp);
-        tp = 0;
-      }
-
-      p = 0;
-      mq = 0;
-      qr = 0;
-    },
-  };
-}
-
-/**
- * BYOB 下行读取：TCP readable -> WebSocket
- *
- * 无背压。
- */
-async function mill(readable, webSocket, onDone) {
-  let reader = null;
-  let byob = false;
-  const tx = mkDn(webSocket);
-  let buf = new ArrayBuffer(CFG.chunk);
-
-  try {
-    try {
-      reader = readable.getReader({ mode: "byob" });
-      byob = true;
-    } catch {
-      reader = readable.getReader();
-      byob = false;
-    }
-
-    for (;;) {
-      let done;
-      let v;
-
-      if (byob) {
-        if (!buf || buf.byteLength < CFG.chunk) {
-          buf = new ArrayBuffer(CFG.chunk);
-        }
-
-        const res = await reader.read(new Uint8Array(buf, 0, CFG.chunk));
-
-        done = res.done;
-        v = res.value;
-      } else {
-        const res = await reader.read();
-
-        done = res.done;
-        v = res.value;
-      }
-
-      if (done) break;
-
-      if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
-      if (!v?.byteLength) continue;
-
-      if (v.byteLength >= CFG.chunk >> 1) {
-        tx.reap();
-
-        if (webSocket.readyState === WS_READY_STATE_OPEN) {
-          webSocket.send(v);
-        }
-
-        buf = new ArrayBuffer(CFG.chunk);
-      } else {
-        tx.send(v.slice());
-
-        try {
-          buf = v.buffer;
-        } catch {
-          buf = new ArrayBuffer(CFG.chunk);
-        }
-      }
-    }
-
-    tx.reap();
-  } catch {
-  } finally {
-    try {
-      tx.reap();
-    } catch {}
-
-    try {
-      reader?.releaseLock();
-    } catch {}
-
-    if (onDone) {
-      onDone();
-    }
-  }
-}
-
-/**
- * TCP 并发竞速连接
- */
-function sprout(hostname, port) {
-  const s = connect({ hostname, port });
-
-  if (s.opened) {
-    return s.opened.then(() => s);
-  }
-
-  return Promise.resolve(s);
-}
-
-function raceSprout(hostname, port) {
-  if (CFG.concur <= 1) {
-    return sprout(hostname, port);
-  }
-
-  const tasks = Array.from({ length: CFG.concur }, () => sprout(hostname, port));
-
-  return Promise.any(tasks).then((winner) => {
-    for (const task of tasks) {
-      task.then(
-        (s) => {
-          if (s !== winner) {
-            try {
-              s.close();
-            } catch {}
-          }
-        },
-        () => {}
-      );
-    }
-
-    return winner;
-  });
-}
 
 var TcpProxy = class extends DurableObject {
   constructor(ctx, env) {
@@ -433,23 +59,13 @@ var TcpProxy = class extends DurableObject {
     }
 
     const protocol = request.headers.get("Sec-WebSocket-Protocol");
-
     if (CLIENT_TOKEN && protocol !== CLIENT_TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
 
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
-
-    try {
-      server.accept({ allowHalfOpen: true });
-    } catch {
-      server.accept();
-    }
-
-    try {
-      server.binaryType = "arraybuffer";
-    } catch {}
+    server.accept();
 
     this.handleSession(server).catch((err) => {
       console.error("[DO] session error:", err?.message || err);
@@ -459,9 +75,7 @@ var TcpProxy = class extends DurableObject {
     const responseInit = { status: 101, webSocket: client };
 
     if (CLIENT_TOKEN) {
-      responseInit.headers = {
-        "Sec-WebSocket-Protocol": CLIENT_TOKEN,
-      };
+      responseInit.headers = { "Sec-WebSocket-Protocol": CLIENT_TOKEN };
     }
 
     return new Response(null, responseInit);
@@ -470,84 +84,52 @@ var TcpProxy = class extends DurableObject {
   async handleSession(webSocket) {
     let remoteSocket = null;
     let remoteWriter = null;
+    let remoteReader = null;
     let connected = false;
     let isClosed = false;
-    let busy = false;
-
-    const uq = mkQ(CFG.upPack, CFG.upQMax, CFG.upQMax >> 8);
+    let writeChain = Promise.resolve();
 
     const cleanup = () => {
       if (isClosed) return;
-
       isClosed = true;
-
-      uq.clear();
-
-      try {
-        remoteWriter?.releaseLock();
-      } catch {}
-
-      try {
-        remoteSocket?.close();
-      } catch {}
-
+      try { remoteWriter?.releaseLock(); } catch {}
+      try { remoteReader?.releaseLock(); } catch {}
+      try { remoteSocket?.close(); } catch {}
       remoteWriter = null;
+      remoteReader = null;
       remoteSocket = null;
-
       safeCloseWebSocket(webSocket);
     };
 
-    const enqueueUpload = (data) => {
-      const u = toU8(data);
-      const n = u.byteLength;
-
-      if (!n) return true;
-
-      if (uq.sow(u)) {
-        return true;
-      }
-
-      cleanup();
-      return false;
+    const writeToRemote = async (chunk) => {
+      if (!remoteWriter || isClosed) return;
+      writeChain = writeChain.then(async () => {
+        if (!remoteWriter || isClosed) return;
+        await remoteWriter.write(chunk);
+      });
+      return writeChain;
     };
 
-    const drainUpload = async () => {
-      if (busy || isClosed) return;
-
-      busy = true;
-
+    const pumpRemoteToWebSocket = async () => {
       try {
-        for (;;) {
-          if (isClosed) break;
-          if (!remoteWriter) break;
-
-          const [d] = uq.bundle();
-
-          if (!d) break;
-
-          await remoteWriter.write(d);
+        while (!isClosed && remoteReader) {
+          const { done, value } = await remoteReader.read();
+          if (done) break;
+          if (webSocket.readyState !== WS_READY_STATE_OPEN) break;
+          if (value?.byteLength > 0) webSocket.send(value);
         }
-      } catch (err) {
-        console.error("[WS->TCP] upload drain error:", err?.message || err);
+      } catch {}
+
+      if (!isClosed) {
+        try { webSocket.send("CLOSE"); } catch {}
         cleanup();
-      } finally {
-        busy = false;
-
-        if (!uq.empty && !isClosed && remoteWriter) {
-          queueMicrotask(() => {
-            drainUpload().catch(() => cleanup());
-          });
-        }
       }
     };
 
     const connectToRemote = async (targetAddr, firstFrameData = "") => {
-      if (connected) {
-        throw new Error("Already connected");
-      }
+      if (connected) throw new Error("Already connected");
 
       const { host, port } = parseAddress(targetAddr);
-
       if (!host || isNaN(port) || port <= 0 || port > 65535) {
         throw new Error("Invalid target address");
       }
@@ -559,55 +141,46 @@ var TcpProxy = class extends DurableObject {
         try {
           let hostname = attempts[i] || host;
 
-          if (hostname.startsWith("[") && hostname.endsWith("]")) {
-            hostname = hostname.slice(1, -1);
+          if (!attempts[i]) {
+            if (hostname.startsWith("[") && hostname.endsWith("]")) {
+              hostname = hostname.slice(1, -1);
+            }
+            if (hostname.includes(":")) {
+              hostname = `${hostname.replace(/:/g, "-")}.sslip.io`;
+            }
           }
 
-          if (!attempts[i] && hostname.includes(":")) {
-            hostname = `${hostname.replace(/:/g, "-")}.sslip.io`;
-          }
-
-          remoteSocket = await raceSprout(hostname, port);
+          remoteSocket = connect({ hostname, port });
+          if (remoteSocket.opened) await remoteSocket.opened;
 
           remoteSocket.closed.catch((err) => {
             if (err?.message?.includes("currently being piped to")) return;
-
             if (!isClosed) {
               console.error("[TCP] socket closed with error:", err?.message || err);
             }
           });
 
           remoteWriter = remoteSocket.writable.getWriter();
+          remoteReader = remoteSocket.readable.getReader();
           connected = true;
 
-          this.ctx.waitUntil(this.updateTarget(`${host}:${port}`));
+          await this.updateTarget(`${host}:${port}`);
 
           if (firstFrameData) {
-            enqueueUpload(encoder.encode(firstFrameData));
-            drainUpload().catch(() => cleanup());
+            await writeToRemote(encoder.encode(firstFrameData));
           }
 
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            webSocket.send("CONNECTED");
-          }
-
-          mill(remoteSocket.readable, webSocket, cleanup).catch(() => cleanup());
-
+          webSocket.send("CONNECTED");
+          pumpRemoteToWebSocket();
           return;
         } catch (err) {
           lastError = err;
-
-          try {
-            remoteWriter?.releaseLock();
-          } catch {}
-
-          try {
-            remoteSocket?.close();
-          } catch {}
-
+          try { remoteWriter?.releaseLock(); } catch {}
+          try { remoteReader?.releaseLock(); } catch {}
+          try { remoteSocket?.close(); } catch {}
           remoteWriter = null;
+          remoteReader = null;
           remoteSocket = null;
-          connected = false;
 
           if (!isCFError(err) || i === attempts.length - 1) {
             throw err;
@@ -629,18 +202,12 @@ var TcpProxy = class extends DurableObject {
             const sep = data.indexOf("|", 8);
             const targetAddr = sep >= 0 ? data.substring(8, sep) : data.substring(8);
             const firstFrameData = sep >= 0 ? data.substring(sep + 1) : "";
-
             await connectToRemote(targetAddr, firstFrameData);
             return;
           }
 
           if (data.startsWith("DATA:")) {
-            if (remoteWriter) {
-              if (enqueueUpload(encoder.encode(data.substring(5)))) {
-                drainUpload().catch(() => cleanup());
-              }
-            }
-
+            if (remoteWriter) await writeToRemote(encoder.encode(data.substring(5)));
             return;
           }
 
@@ -652,18 +219,17 @@ var TcpProxy = class extends DurableObject {
           return;
         }
 
-        if (remoteWriter) {
-          if (enqueueUpload(data)) {
-            drainUpload().catch(() => cleanup());
-          }
+        if (data instanceof ArrayBuffer && remoteWriter) {
+          await writeToRemote(new Uint8Array(data));
+          return;
+        }
+
+        if (data instanceof Uint8Array && remoteWriter) {
+          await writeToRemote(data);
+          return;
         }
       } catch (err) {
-        try {
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            webSocket.send("ERROR:" + (err?.message || String(err)));
-          }
-        } catch {}
-
+        try { webSocket.send("ERROR:" + (err?.message || String(err))); } catch {}
         cleanup();
       }
     });
@@ -676,7 +242,6 @@ var TcpProxy = class extends DurableObject {
   async updateTarget(target) {
     try {
       if (!this.env?.ECH_DB) return;
-
       await this.env.ECH_DB.prepare(
         "UPDATE do_instances SET target = ? WHERE id = ?"
       )
@@ -697,30 +262,25 @@ var TcpProxy = class extends DurableObject {
 __name(TcpProxy, "TcpProxy");
 
 var src_default = {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
     const upgradeHeader = request.headers.get("Upgrade");
     const isWebSocket = upgradeHeader && upgradeHeader.toLowerCase() === "websocket";
 
-    /**
-     * 只要是 WebSocket Upgrade，就交给 Durable Object：ECH_DL。
-     */
+    /** 只要是 WebSocket Upgrade，就交给 Durable Object：ECH_DL。 */
     if (isWebSocket) {
       const id = env.ECH_DL.newUniqueId();
       const stub = env.ECH_DL.get(id);
 
-      if (env.ECH_DB) {
-        ctx.waitUntil(
-          env.ECH_DB.prepare(
-            "INSERT INTO do_instances (id, created_at, target) VALUES (?, ?, ?)"
-          )
-            .bind(id.toString(), new Date().toISOString(), "unknown")
-            .run()
-            .catch((e) => {
-              console.error("[D1] Failed to record DO instance:", e?.message || e);
-            })
-        );
+      try {
+        await env.ECH_DB.prepare(
+          "INSERT INTO do_instances (id, created_at, target) VALUES (?, ?, ?)"
+        )
+          .bind(id.toString(), new Date().toISOString(), "unknown")
+          .run();
+      } catch (e) {
+        console.error("[D1] Failed to record DO instance:", e?.message || e);
       }
 
       return stub.fetch(request);
@@ -730,9 +290,7 @@ var src_default = {
       return new Response("WebSocket Proxy Server", { status: 200 });
     }
 
-    /**
-     * GET /api/cleanup/list?admin=CHANGE_ME_ADMIN_TOKEN
-     */
+    /** GET /api/cleanup/list?admin=CHANGE_ME_ADMIN_TOKEN */
     if (path === "/api/cleanup/list" && request.method === "GET") {
       if (!checkAdmin(request, url)) {
         return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -760,10 +318,7 @@ var src_default = {
       }
     }
 
-    /**
-     * POST /api/cleanup?admin=...
-     * POST /api/cleanup?all=1&admin=...
-     */
+    /** POST /api/cleanup?admin=... 或 POST /api/cleanup?all=1&admin=... */
     if (path === "/api/cleanup" && request.method === "POST") {
       if (!checkAdmin(request, url)) {
         return Response.json({ error: "Unauthorized" }, { status: 401 });
@@ -771,12 +326,10 @@ var src_default = {
 
       try {
         const cleanAll = url.searchParams.get("all") === "1";
-
         const summary = await cleanInstances(env, {
           cleanAll,
           olderThanMs: CLEANUP_RETENTION_MS,
         });
-
         return Response.json(summary);
       } catch (e) {
         return Response.json({ error: e.message }, { status: 500 });
@@ -786,9 +339,7 @@ var src_default = {
     return new Response("Not Found", { status: 404 });
   },
 
-  /**
-   * 定时任务：自动清理 1 天前的 do_instances 记录。
-   */
+  /** 定时任务：自动清理 1 天前的 do_instances 记录。 */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       cleanInstances(env, {
@@ -802,10 +353,8 @@ var src_default = {
 
 function checkAdmin(request, url) {
   if (!ADMIN_TOKEN) return true;
-
   const queryToken = url.searchParams.get("admin");
   const headerToken = request.headers.get("X-Admin-Token");
-
   return queryToken === ADMIN_TOKEN || headerToken === ADMIN_TOKEN;
 }
 
@@ -822,7 +371,6 @@ async function cleanInstances(
         .all();
 
   const ids = result.results.map((r) => r.id);
-
   let cleaned = 0;
   let failed = 0;
   const errors = [];
@@ -831,7 +379,6 @@ async function cleanInstances(
     try {
       const doId = env.ECH_DL.idFromString(hexId);
       const stub = env.ECH_DL.get(doId);
-
       await stub.cleanup();
 
       await env.ECH_DB.prepare("DELETE FROM do_instances WHERE id = ?")
@@ -841,12 +388,7 @@ async function cleanInstances(
       cleaned++;
     } catch (e) {
       failed++;
-
-      const errorItem = {
-        id: hexId,
-        error: e?.message || String(e),
-      };
-
+      const errorItem = { id: hexId, error: e?.message || String(e) };
       errors.push(errorItem);
       console.error("[Cleanup] Failed:", errorItem);
     }
@@ -869,27 +411,19 @@ async function cleanInstances(
 function parseAddress(addr) {
   if (!addr) throw new Error("Empty target address");
 
-  /**
-   * IPv6：[2606:4700::6810:85e5]:443
-   */
+  /** IPv6：[2606:4700::6810:85e5]:443 */
   if (addr[0] === "[") {
     const end = addr.indexOf("]");
-
     if (end < 0) throw new Error("Invalid IPv6 address");
-
     return {
       host: addr.substring(1, end),
       port: parseInt(addr.substring(end + 2), 10),
     };
   }
 
-  /**
-   * IPv4 / 域名：example.com:443
-   */
+  /** IPv4 / 域名：example.com:443 */
   const sep = addr.lastIndexOf(":");
-
   if (sep < 0) throw new Error("Missing port");
-
   return {
     host: addr.substring(0, sep),
     port: parseInt(addr.substring(sep + 1), 10),
@@ -898,7 +432,6 @@ function parseAddress(addr) {
 
 function isCFError(err) {
   const msg = err?.message?.toLowerCase() || "";
-
   return (
     msg.includes("proxy request") ||
     msg.includes("cannot connect") ||
