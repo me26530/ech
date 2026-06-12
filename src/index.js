@@ -30,7 +30,7 @@ var CLEANUP_LIST_LIMIT = 100;
 var CLEANUP_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /** Cloudflare fallback IP，保留 ECH 原版逻辑 */
-const CF_FALLBACK_IPS = ["[2a00:1098:2b::1:6815:5881]"];
+const CF_FALLBACK_IPS = ["fdip.houyitfg.top"];
 
 const encoder = new TextEncoder();
 
