@@ -1,11 +1,21 @@
-name = "sjlh"
-main = "worker.js"
-compatibility_date = "2023-01-01"
+name = "ech-go"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
 
 [[durable_objects.bindings]]
-name = "TUNNEL_PROXY"
-class_name = "TunnelProxy"
+name = "ECH_DL"
+class_name = "TcpProxy"
 
+# 如果部署时报 new_sqlite_classes 不支持，改成：new_classes = ["TcpProxy"]
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["TunnelProxy"]
+new_sqlite_classes = ["TcpProxy"]
+
+[[d1_databases]]
+binding = "ECH_DB"
+database_name = "__D1_DATABASE_NAME__"
+database_id = "__D1_DATABASE_ID__"
+
+[triggers]
+crons = ["0 */6 * * *"]
